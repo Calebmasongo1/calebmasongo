@@ -50,6 +50,19 @@ favour trend alignment, a decisive close and low cost. The model learns from rea
   handles are created once; there are no per-tick allocations of note.
   *Real-world speed is limited by your broker and network, not the code:* run it on a VPS in the same data
   centre as your broker's trade server (ping < 5 ms) on a raw-spread/ECN account.
+- **Multi-position burst entries:** each entry is split into `InpEntryOrders` positions (default 3) fired
+  back-to-back with `OrderSendAsync`, so they go out in parallel instead of waiting for each confirmation.
+  Each pyramid add is also a burst (`InpAddOrders`, default 2). With 3 adds that's up to 9 positions,
+  capped by `InpMaxPositions`. **The total risk is split across the positions, not multiplied.** More positions
+  don't add edge; they let the EA exit in stages.
+- **Scale-out ladder (server-side take-profits):** `InpScaleOutR = "1.0,2.0,0"` gives position 1 a TP at 1R,
+  position 2 a TP at 2R, and position 3 no TP, so it runs on the trailing stop. These TPs sit on the broker's
+  server, so they fill at the broker with no terminal/VPS round-trip. That is the fastest exit possible.
+- **Fast flatten:** every full exit (flat time, daily limit, stale trade, basket target, the on-chart red
+  **CLOSE ALL** button) sends all close requests at once, asynchronously. Any position still open is re-sent
+  every ~300 ms until the EA is flat. Rejected async requests are logged by `OnTradeTransaction`.
+- **Netting accounts** merge positions on the same symbol, so the burst and the ladder switch off
+  automatically there. Use a **hedging** account to get the multi-position behaviour.
 - **Position size:** risk % of equity ÷ the exact loss per lot to the stop (from `OrderCalcProfit`, so contract
   size and account currency are handled). Capped by free margin.
 - **Stops:** structural (beyond the signal bar's extreme + 0.15 ATR), floored at 0.8 ATR. Setups needing more
@@ -119,6 +132,10 @@ backtest, stop and investigate before going live.
 | `InpStaleBars` | 12 | Close trades that haven't reached +0.5R within an hour on M5 |
 | `InpMaxDailyLossPct` | 2.0 | Daily circuit breaker |
 | `InpLearnOnline` | true | Update scorer weights after each trade |
+| `InpEntryOrders` / `InpAddOrders` | 3 / 2 | Positions fired at once per entry / per add (risk split) |
+| `InpScaleOutR` | 1.0,2.0,0 | Server-side TP per entry position in R; 0 = runner |
+| `InpMaxPositions` | 20 | Hard cap on simultaneous positions |
+| `InpAsyncExecution` | true | Parallel order and close sending |
 
 ## References
 - Andersen, T. & Bollerslev, T. (1998). Deutsche mark–dollar volatility: intraday activity patterns, macroeconomic announcements, and longer run dependencies. *Journal of Finance*, 53(1).

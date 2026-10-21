@@ -95,6 +95,14 @@ input double InpAddLotMult        = 1.00;   // Add size relative to the initial 
 input double InpPyramidRiskCapR   = 0.50;   // Max worst-case basket loss after an add, in R (0 = add only risk-free)
 input double InpMinAddStopATR     = 0.80;   // Required room between price and basket stop to allow an add
 
+input group "=== Execution: multi-position burst & fast close ==="
+input int    InpEntryOrders       = 3;      // Positions opened at once per entry (risk is SPLIT, not multiplied)
+input int    InpAddOrders         = 2;      // Positions opened at once per pyramid add
+input string InpScaleOutR         = "1.0,2.0,0"; // Server-side TP per entry position, in R (0 = runner, trailed)
+input int    InpMaxPositions      = 20;     // Hard cap on open positions for this EA
+input bool   InpAsyncExecution    = true;   // Fire all orders/closes in parallel (OrderSendAsync)
+input bool   InpShowCloseButton   = true;   // On-chart "CLOSE ALL" panic button
+
 input group "=== Adaptive scorer (online logistic model) ==="
 input double InpMinProb           = 0.60;   // Minimum win probability to take a setup
 input bool   InpLearnOnline       = true;   // Update weights from every closed basket
@@ -143,6 +151,10 @@ struct Basket
    bool     hasFeat;
    int      setup;        // 0 breakout, 1 sweep
    int      session;      // 0 London, 1 New York
+   double   initSL;       // stop of the initial entry
+   bool     syncPending;  // burst sent async: refresh entry/risk from actual fills
+   int      expected;     // positions expected once all burst orders fill
+   datetime lastAddTime;
    double   feat[NF];
 };
 Basket g_b;
@@ -162,6 +174,11 @@ datetime g_panelAt = 0;
 datetime g_addLogAt = 0;
 string   g_status = "init";
 string   g_gvp = "";
+double   g_tpR[];                 // scale-out ladder, in R
+bool     g_hedging = true;        // netting accounts merge positions -> burst/ladder disabled
+bool     g_closing = false;
+ulong    g_closeSentMs = 0;
+#define BTN_CLOSE "ASAI_CLOSE_ALL"
 
 //==================================================================
 // Small helpers
@@ -269,12 +286,12 @@ int CollectPositions(ulong &tickets[])
    return ArraySize(tickets);
 }
 
-bool SendMarket(const int dir, const double lot, const double sl, const string cmt, double &fill)
+bool SendMarket(const int dir, const double lot, const double sl, const double tp, const string cmt, double &fill)
 {
    for(int a = 0; a < 3; a++)
    {
-      bool ok = (dir > 0) ? trade.Buy(lot, _Symbol, 0.0, sl, 0.0, cmt)
-                          : trade.Sell(lot, _Symbol, 0.0, sl, 0.0, cmt);
+      bool ok = (dir > 0) ? trade.Buy(lot, _Symbol, 0.0, sl, tp, cmt)
+                          : trade.Sell(lot, _Symbol, 0.0, sl, tp, cmt);
       uint rc = trade.ResultRetcode();
       if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_DONE_PARTIAL || rc == TRADE_RETCODE_PLACED))
       {
@@ -288,14 +305,58 @@ bool SendMarket(const int dir, const double lot, const double sl, const string c
    return false;
 }
 
+// Split a total volume into up to `want` legal lots (each >= min lot, multiples of step)
+int SplitLots(const double total, int want, double &lots[])
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double mn   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(step <= 0) step = 0.01;
+   if(!g_hedging) want = 1;
+   want = MathMax(1, want);
+   long totalSteps = (long)MathFloor(total / step + 1e-9);
+   long minSteps   = MathMax(1, (long)MathRound(mn / step));
+   while(want > 1 && totalSteps / want < minSteps) want--;
+   if(totalSteps < minSteps) { ArrayResize(lots, 0); return 0; }
+   ArrayResize(lots, want);
+   long each = totalSteps / want, rem = totalSteps - each * want;
+   int vd = VolumeDigits(step);
+   for(int i = 0; i < want; i++)
+      lots[i] = NormalizeDouble((each + (i < rem ? 1 : 0)) * step, vd);
+   return want;
+}
+
+// Fire several market orders back-to-back (in parallel when async). Returns orders accepted.
+int SendBurst(const int dir, const double &lots[], const double sl, const double &tps[], const string cmt, double &avgFill)
+{
+   int n = ArraySize(lots), ok = 0;
+   double sumV = 0, sumVF = 0;
+   trade.SetAsyncMode(InpAsyncExecution);
+   for(int i = 0; i < n; i++)
+   {
+      double fill = 0;
+      if(SendMarket(dir, lots[i], sl, tps[i], cmt + "#" + IntegerToString(i + 1), fill))
+      { ok++; sumV += lots[i]; sumVF += lots[i] * fill; }
+   }
+   trade.SetAsyncMode(false);
+   avgFill = (sumV > 0) ? sumVF / sumV : 0;
+   return ok;
+}
+
+// Flatten everything: all close requests go out at once; leftovers are re-sent on later ticks
 void CloseAll(const string why)
 {
    ulong tk[];
    int n = CollectPositions(tk);
-   for(int i = 0; i < n; i++)
-      for(int a = 0; a < 3; a++)
-         if(trade.PositionClose(tk[i], InpDeviationPoints)) break;
-   if(n > 0) PrintFormat("[%s] Closed %d position(s): %s", InpComment, n, why);
+   if(n == 0) return;
+   ulong nowMs = GetTickCount64();
+   if(g_closing && !InTester() && nowMs - g_closeSentMs < 300) return;   // previous wave still in flight
+   bool first = !g_closing;
+   g_closing = true;
+   g_closeSentMs = nowMs;
+   trade.SetAsyncMode(InpAsyncExecution);
+   for(int i = 0; i < n; i++) trade.PositionClose(tk[i], InpDeviationPoints);
+   trade.SetAsyncMode(false);
+   if(first) PrintFormat("[%s] Closing %d position(s): %s", InpComment, n, why);
 }
 
 // Ratchet every basket position's stop toward newSL (never loosens)
@@ -456,6 +517,9 @@ void RecoverBasket(ulong &tk[], const int n)
    g_b.adds = n - 1;
    g_b.baseLot = firstVol;
    g_b.openTime = oldest;
+   g_b.lastAddTime = newest;
+   g_b.expected = n;
+   g_b.syncPending = false;
    g_b.hasFeat = false;
 
    if(GlobalVariableCheck(g_gvp + "open") && GlobalVariableGet(g_gvp + "dir") == dir)
@@ -475,6 +539,7 @@ void RecoverBasket(ulong &tk[], const int n)
       g_b.riskDist = d;
       g_b.riskMoney = g_b.baseLot * LossPerLot(dir, firstPx, firstPx - dir * d);
    }
+   g_b.initSL = g_b.firstEntry - dir * g_b.riskDist;
    MqlTick tick;
    SymbolInfoTick(_Symbol, tick);
    g_b.extreme = (dir > 0) ? MathMax(tick.bid, g_b.firstEntry) : MathMin(tick.ask, g_b.firstEntry);
@@ -607,13 +672,30 @@ bool OpenBasket(const int dir, double sl, const double p, const double &f[], con
       else { g_status = "account too small for this stop"; return false; }
    }
 
+   // Split the risk-sized volume into a burst of positions, each with its own server-side TP rung
+   double lots[];
+   int legs = SplitLots(nl, MathMin(InpEntryOrders, InpMaxPositions), lots);
+   if(legs == 0) return false;
+   double tps[];
+   ArrayResize(tps, legs);
+   double d = dir * (entry - sl);
+   int nr = ArraySize(g_tpR);
+   for(int i = 0; i < legs; i++)
+   {
+      double rr = (g_hedging && nr > 0) ? g_tpR[MathMin(i, nr - 1)] : 0.0;
+      tps[i] = (rr > 0) ? NP(entry + dir * rr * d) : 0.0;
+   }
+
    string cmt = InpComment + (setup == 0 ? " BO " : " SW ") + g_sess[k].name;
    double fill = 0;
-   if(!SendMarket(dir, nl, sl, cmt, fill)) return false;
+   int sent = SendBurst(dir, lots, sl, tps, cmt, fill);
+   if(sent == 0) return false;
+   if(fill <= 0) fill = entry;
 
    ZeroMemory(g_b);
    g_b.active     = true;
    g_b.dir        = dir;
+   g_b.initSL     = sl;
    g_b.riskDist   = MathMax(dir * (fill - sl), _Point);
    g_b.baseLot    = nl;
    g_b.riskMoney  = nl * LossPerLot(dir, fill, sl);
@@ -621,19 +703,22 @@ bool OpenBasket(const int dir, double sl, const double p, const double &f[], con
    g_b.lastAdd    = fill;
    g_b.adds       = 0;
    g_b.openTime   = TimeCurrent();
+   g_b.lastAddTime= g_b.openTime;
    g_b.extreme    = fill;
    g_b.prob       = p;
    g_b.hasFeat    = true;
    g_b.setup      = setup;
    g_b.session    = k;
+   g_b.expected   = g_hedging ? sent : 1;
+   g_b.syncPending= true;
    for(int i = 0; i < NF; i++) g_b.feat[i] = f[i];
    SaveBasketGV();
 
    g_dayTrades++;
    g_sess[k].trades++;
-   PrintFormat("[%s] OPEN %s %s %s lot=%.2f @%.2f SL=%.2f 1R=%.2f p=%.3f risk=%.2f",
+   PrintFormat("[%s] OPEN %s %s %s %d/%d position(s) total lot=%.2f @%.2f SL=%.2f 1R=%.2f p=%.3f risk=%.2f",
                InpComment, dir > 0 ? "BUY" : "SELL", setup == 0 ? "breakout" : "sweep", g_sess[k].name,
-               nl, fill, sl, g_b.riskDist, p, g_b.riskMoney);
+               sent, legs, nl, fill, sl, g_b.riskDist, p, g_b.riskMoney);
    return true;
 }
 
@@ -825,20 +910,67 @@ void TryAdd(ulong &tk[], const int n, const MqlTick &tick, const double atr)
    }
    if(!MarginOK(dir, addLot, entry)) { g_status = "add skipped: margin"; return; }
 
+   double lots[];
+   int room_n = InpMaxPositions - n;
+   if(room_n <= 0) { g_status = "add skipped: position cap"; return; }
+   int legs = SplitLots(addLot, MathMin(InpAddOrders, room_n), lots);
+   if(legs == 0) return;
+   double tps[];
+   ArrayResize(tps, legs);
+   ArrayInitialize(tps, 0.0);            // adds are runners: the trailing stop exits them
+
    double fill = 0;
-   if(!SendMarket(dir, addLot, newSL, InpComment + " ADD" + IntegerToString(g_b.adds + 1), fill)) return;
+   g_b.lastAddTime = TimeCurrent();
+   int sent = SendBurst(dir, lots, newSL, tps, InpComment + " ADD" + IntegerToString(g_b.adds + 1), fill);
+   if(sent == 0) return;
    g_b.adds++;
-   g_b.lastAdd = fill;
+   g_b.lastAdd = (fill > 0) ? fill : entry;
+   g_b.expected = g_hedging ? n + sent : 1;
+   g_b.syncPending = true;
    SetBasketSL(newSL, 0);
    SaveBasketGV();
-   PrintFormat("[%s] ADD #%d %s lot=%.2f @%.2f basket SL=%.2f (worst case %.2fR)",
-               InpComment, g_b.adds, dir > 0 ? "BUY" : "SELL", addLot, fill, newSL, -InpPyramidRiskCapR);
+   PrintFormat("[%s] ADD #%d %s %d position(s) lot=%.2f @%.2f basket SL=%.2f (worst case %.2fR)",
+               InpComment, g_b.adds, dir > 0 ? "BUY" : "SELL", sent, addLot, g_b.lastAdd, newSL, -InpPyramidRiskCapR);
+}
+
+// After an async burst, replace the requested price with the real volume-weighted fills
+void SyncFills(ulong &tk[], const int n)
+{
+   if(!g_b.syncPending) return;
+   if(n < g_b.expected && TimeCurrent() - g_b.lastAddTime < 3) return;
+   double v = 0, ve = 0;
+   for(int i = 0; i < n; i++)
+   {
+      if(!PositionSelectByTicket(tk[i])) continue;
+      if(g_b.adds > 0 && (datetime)PositionGetInteger(POSITION_TIME) < g_b.lastAddTime) continue;
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      v  += vol;
+      ve += vol * PositionGetDouble(POSITION_PRICE_OPEN);
+   }
+   if(v > 0)
+   {
+      double avg = ve / v;
+      if(g_b.adds == 0)
+      {
+         g_b.firstEntry = avg;
+         g_b.riskDist   = MathMax(g_b.dir * (avg - g_b.initSL), _Point);
+         g_b.baseLot    = v;
+         g_b.riskMoney  = v * LossPerLot(g_b.dir, avg, g_b.initSL);
+         g_b.extreme    = (g_b.dir > 0) ? MathMax(g_b.extreme, avg) : MathMin(g_b.extreme, avg);
+      }
+      g_b.lastAdd = avg;
+   }
+   g_b.syncPending = false;
+   SaveBasketGV();
 }
 
 void ManageBasket()
 {
    ulong tk[];
    int n = CollectPositions(tk);
+   if(n == 0) g_closing = false;
+   else if(g_closing) { CloseAll("retry"); return; }   // keep flattening until nothing is left
+
    if(!g_b.active)
    {
       if(n > 0) RecoverBasket(tk, n);
@@ -846,10 +978,11 @@ void ManageBasket()
    }
    if(n == 0)
    {
-      if(TimeCurrent() - g_b.openTime < 3) return;   // position list may lag a just-filled order
+      if(g_b.syncPending && TimeCurrent() - g_b.lastAddTime < 5) return;   // async fills may still be arriving
       OnBasketClosed();
       return;
    }
+   SyncFills(tk, n);
 
    if(IsFlatTime()) { CloseAll("flat time"); return; }
 
@@ -885,7 +1018,7 @@ void ManageBasket()
    }
    if(has) SetBasketSL(desired, 0.05 * atr);
 
-   if(InpUsePyramid && g_b.adds < InpMaxAdds && dir * (price - g_b.lastAdd) >= InpAddEveryR * g_b.riskDist)
+   if(InpUsePyramid && !g_b.syncPending && g_b.adds < InpMaxAdds && dir * (price - g_b.lastAdd) >= InpAddEveryR * g_b.riskDist)
       TryAdd(tk, n, tick, atr);
 }
 
@@ -963,6 +1096,16 @@ int OnInit()
    g_friFlatMin = ParseHHMM(InpFridayFlatTime);
    if(g_flatMin < 0 || g_friFlatMin < 0) { Print("Invalid flat time"); return INIT_PARAMETERS_INCORRECT; }
    if(InpRiskPercent <= 0 || InpRiskPercent > 5) { Print("Risk per trade must be in (0, 5] %"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpEntryOrders < 1 || InpAddOrders < 1 || InpMaxPositions < 1) { Print("Order counts must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+
+   // Scale-out ladder, e.g. "1.0,2.0,0": position 1 TP at 1R, position 2 at 2R, the rest run on the trail
+   string parts[];
+   int np = StringSplit(InpScaleOutR, ',', parts);
+   ArrayResize(g_tpR, MathMax(np, 0));
+   for(int i = 0; i < np; i++) { StringTrimLeft(parts[i]); StringTrimRight(parts[i]); g_tpR[i] = MathMax(0.0, StringToDouble(parts[i])); }
+
+   g_hedging = (AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+   if(!g_hedging) PrintFormat("[%s] Netting account: positions merge, so burst entries and the TP ladder are disabled", InpComment);
 
    hEmaFast = iMA(_Symbol, InpTrendTF, InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
    hEmaSlow = iMA(_Symbol, InpTrendTF, InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
@@ -985,6 +1128,7 @@ int OnInit()
    ZeroMemory(g_b);
    LoadModel();
    g_lastBar = iTime(_Symbol, InpSignalTF, 0);   // never act on a signal bar that closed before attach
+   if(InpShowCloseButton && !(InTester() && !MQLInfoInteger(MQL_VISUAL_MODE))) CreateCloseButton();
    PrintFormat("[%s] Ready. Model updates so far: %d", InpComment, g_modelUpdates);
    return INIT_SUCCEEDED;
 }
@@ -994,7 +1138,44 @@ void OnDeinit(const int reason)
    if(g_modelUpdates > 0) SaveModel();
    IndicatorRelease(hEmaFast); IndicatorRelease(hEmaSlow); IndicatorRelease(hAdx);
    IndicatorRelease(hAtrH1);   IndicatorRelease(hAtr);     IndicatorRelease(hRsi);
+   ObjectDelete(0, BTN_CLOSE);
    Comment("");
+}
+
+void CreateCloseButton()
+{
+   ObjectDelete(0, BTN_CLOSE);
+   if(!ObjectCreate(0, BTN_CLOSE, OBJ_BUTTON, 0, 0, 0)) return;
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_XDISTANCE, 150);
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_YDISTANCE, 30);
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_XSIZE, 140);
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_YSIZE, 32);
+   ObjectSetString(0, BTN_CLOSE, OBJPROP_TEXT, "CLOSE ALL");
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_BGCOLOR, clrFireBrick);
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_FONTSIZE, 10);
+   ObjectSetInteger(0, BTN_CLOSE, OBJPROP_SELECTABLE, false);
+   ChartRedraw();
+}
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == BTN_CLOSE)
+   {
+      CloseAll("manual CLOSE ALL button");
+      ObjectSetInteger(0, BTN_CLOSE, OBJPROP_STATE, false);
+      ChartRedraw();
+   }
+}
+
+// Async orders report their outcome here; surface rejections immediately
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+{
+   if(!InpAsyncExecution || trans.type != TRADE_TRANSACTION_REQUEST || request.magic != (ulong)InpMagic) return;
+   if(result.retcode != TRADE_RETCODE_DONE && result.retcode != TRADE_RETCODE_DONE_PARTIAL && result.retcode != TRADE_RETCODE_PLACED)
+      PrintFormat("[%s] Async request rejected: retcode %u (%s %.2f lots)", InpComment, result.retcode,
+                  request.position > 0 ? "close" : "open", request.volume);
 }
 
 void OnTick()
